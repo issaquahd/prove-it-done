@@ -403,6 +403,16 @@ def _print_receipt(idx, receipt, ok, msg):
     print(redact("%s  [%d] %s%s -- %s (via %s)" % (tag, idx, receipt.spec, extra, msg, receipt.instrument())))
 
 
+def _next_option_value(it, option):
+    try:
+        value = next(it)
+    except StopIteration:
+        raise SpecError("%s needs a value" % option)
+    if value.startswith("--"):
+        raise SpecError("%s needs a value" % option)
+    return value
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     timeout, allow_shell, min_inst, list_only, do_reopen, ledger = 60.0, False, 1, False, False, None
@@ -411,17 +421,25 @@ def main(argv=None):
     try:
         for a in it:
             if a == "--timeout":
-                timeout = float(next(it))
+                raw_timeout = _next_option_value(it, a)
+                try:
+                    timeout = float(raw_timeout)
+                except ValueError:
+                    raise SpecError("%s expects a number of seconds, got %r" % (a, raw_timeout))
             elif a == "--allow-shell":
                 allow_shell = True
             elif a == "--min-instruments":
-                min_inst = int(next(it))
+                raw_min_inst = _next_option_value(it, a)
+                try:
+                    min_inst = int(raw_min_inst)
+                except ValueError:
+                    raise SpecError("%s expects a whole number, got %r" % (a, raw_min_inst))
             elif a == "--list":
                 list_only = True
             elif a == "--reopen":
                 do_reopen = True
             elif a == "--ledger":
-                ledger = next(it)
+                ledger = _next_option_value(it, a)
             elif a in ("-h", "--help"):
                 print(__doc__)
                 return 0
@@ -429,9 +447,6 @@ def main(argv=None):
                 raise SpecError("unknown option %s" % a)
             else:
                 specs.append(a)
-    except (StopIteration, ValueError) as e:
-        print("usage error: %s" % (e or "missing value"), file=sys.stderr)
-        return 2
     except SpecError as e:
         print("usage error: %s" % e, file=sys.stderr)
         return 2

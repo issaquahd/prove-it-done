@@ -4,6 +4,10 @@ All notable changes to this project are listed here. The format follows [Keep a 
 
 ## [Unreleased]
 
+### Fixed
+
+- Command-line usage errors now identify missing and invalid values for `--timeout`, `--min-instruments`, and `--ledger`.
+
 ## [0.1.0] - 2026-10-11
 
 ### Added

@@ -469,6 +469,22 @@ class UsageTests(unittest.TestCase):
     def test_no_args(self):
         self.assertEqual(run_main([])[0], 2)
 
+    def test_missing_value_names_option(self):
+        for option in ("--timeout", "--min-instruments", "--ledger"):
+            rc, out = run_main([option])
+            self.assertEqual(rc, 2)
+            self.assertIn(option + " needs a value", out)
+
+    def test_timeout_invalid_value_names_option(self):
+        rc, out = run_main(["--timeout", "abc", "file:x"])
+        self.assertEqual(rc, 2)
+        self.assertIn("--timeout expects a number of seconds, got 'abc'", out)
+
+    def test_min_instruments_invalid_value_names_option(self):
+        rc, out = run_main(["--min-instruments", "x", "file:x"])
+        self.assertEqual(rc, 2)
+        self.assertIn("--min-instruments expects a whole number, got 'x'", out)
+
     def test_both_modes(self):
         self.assertEqual(run_main(["--ledger", "x.md", "file:x"])[0], 2)
 
