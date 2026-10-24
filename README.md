@@ -73,3 +73,4 @@ Several projects already do parts of this: evidence-before-claims prose skills, 
 ## License
 
 MIT. See `LICENSE`.
+- Nature v0.1 confirmed live 2026-10-24 by Gherkin-lite
