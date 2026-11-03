@@ -412,9 +412,10 @@ class BaselineTests(unittest.TestCase):
 
         def write(name, text):
             os.makedirs(os.path.dirname(os.path.join(cls.d, name)), exist_ok=True)
-            with open(os.path.join(cls.d, name), "w") as fh:
+            with open(os.path.join(cls.d, name), "w", newline="\n") as fh:  # LF on Windows too, for sha256=
                 fh.write(text)
         git("init", "-q")
+        git("config", "core.autocrlf", "false")
         write("calc.py", "def add(a, b):\n    return a - b\n")
         write("test_add.py", "import calc, sys\nsys.exit(0 if calc.add(2, 2) == 4 else 1)\n")
         # deliberately vacuous: passes whatever calc.py does
