@@ -51,11 +51,57 @@ python3 scripts/verify_receipts.py --help
 
 Receipt kinds: `cmd:` (no shell), `sh:` (shell, opt-in), `file:` (exists, SHA-256), `dir:`, `http:` (status, body text), `commit:` (exists, touches a path, on a branch), and `said:` (recorded self-report, never counted). The full reference is `references/receipts.md`.
 
+**Fail before, pass after.** Add `| baseline=REF` to a `cmd:`, `sh:`, `file:` or `dir:` receipt and the verifier also runs it against the pre-change state. A receipt that passes there too is VACUOUS and does not count. See [Baselines](#baselines-fail-before-pass-after) below.
+
 **Examples.** `examples/` has four worked ledgers with verifier output: a deploy, a config change, a published page, and a worker whose "ok" was false.
 
 **Measure it.** `evals/evals.json` has eight test prompts. `evals/run.md` describes a with/without comparison scored by a deterministic unproven-completion detector, and shows the scorer working on four synthetic transcripts.
 
 **Test.** `python3 -m unittest discover -s tests`. `.github/workflows/ci.yml` runs the same tests on Linux, macOS and Windows once the repository is on GitHub.
+
+## Baselines: fail before, pass after
+
+A receipt that already passes before the change is not evidence of the change. A test that always exits 0 passes after a real fix and after no fix at all. Grading pipelines for agent training check for this: they run the grader on an empty patch and require it to fail. In one production campaign, vacuous tests on two tasks made 22.9% of the positive labels wrong ([Sandman, arXiv 2610.39711](https://arxiv.org/abs/2610.39711)). `baseline=` applies the same check to a receipt.
+
+- `baseline=REF` (on `cmd:`, `sh:`, `file:`, `dir:`) runs the receipt a second time in a temporary git worktree at `REF`, from the same relative directory. Use `HEAD` for uncommitted work and `HEAD~1` after you commit. The worktree is removed afterwards.
+- `keep=PATH[,PATH]` copies files from the current tree into that worktree first. Use it when the test is part of the change. Without it, the baseline would only show that the test did not exist yet, so the verifier reports N/A and asks for `keep=`.
+- `before=absent|present|SHA256` (on `file:`, `dir:`) records the pre-change state when no git ref has it.
+
+Each receipt with a baseline gets one verdict:
+
+| Verdict | Meaning | Counts as evidence |
+| --- | --- | --- |
+| PROVEN | fails before the change, passes after | yes |
+| VACUOUS | passes before and after | no |
+| BROKEN | fails after the change | no (the step fails) |
+| N/A | no baseline possible (`http:`, `commit:`, `said:`, or the baseline run errored) | as without a baseline, never as PROVEN |
+
+`--require-baseline` makes a done step PROVEN only when at least one behaviour receipt is PROVEN against its baseline and no receipt is VACUOUS.
+
+Worked example: `calc.add()` returned `a - b`. The fix is in the working tree and not yet committed. `tests/test_smoke.py` is new in the change and always exits 0.
+
+```markdown
+- [x] 1. add() returns the sum
+  - receipt: `cmd:python3 tests/test_add.py | baseline=HEAD`
+  - receipt: `cmd:python3 tests/test_smoke.py | baseline=HEAD | keep=tests/test_smoke.py`
+- [x] 2. The smoke test covers the fix
+  - receipt: `cmd:python3 tests/test_smoke.py | baseline=HEAD | keep=tests/test_smoke.py`
+```
+
+```
+$ python3 scripts/verify_receipts.py --ledger receipts.md
+step 1 add() returns the sum
+PASS  [1] cmd:python3 tests/test_add.py | baseline=HEAD -- exit 0; PROVEN: baseline HEAD: exit 1, expected 0; fails before the change, passes after (via python3)
+VACUOUS  [2] cmd:python3 tests/test_smoke.py | baseline=HEAD | keep=tests/test_smoke.py -- exit 0; VACUOUS: baseline HEAD: exit 0; it passes before the change too, so it is not evidence (via python3)
+  -> PROVEN: 2 receipt(s); behaviour checked through 1 instrument(s): python3; 1 failed before the change; receipt 2 VACUOUS, not counted
+step 2 The smoke test covers the fix
+VACUOUS  [3] cmd:python3 tests/test_smoke.py | baseline=HEAD | keep=tests/test_smoke.py -- exit 0; VACUOUS: baseline HEAD: exit 0; it passes before the change too, so it is not evidence (via python3)
+  -> UNPROVEN: only VACUOUS behaviour receipts passed; a receipt that passes before the change is not evidence
+summary: 3 pass, 0 fail; 1 of 2 done step(s) proven
+baseline: 1 proven, 2 vacuous, 0 broken, 0 n/a
+```
+
+With `--require-baseline`, step 1 is also UNPROVEN (`receipt 2 VACUOUS: passes before the change too, so it is not evidence`): remove the smoke test from the claim or replace it with a test that can fail. Receipts with no `baseline=` or `before=` print exactly as before, so existing ledgers are unchanged.
 
 ## Limits
 
@@ -64,6 +110,7 @@ Receipt kinds: `cmd:` (no shell), `sh:` (shell, opt-in), `file:` (exists, SHA-25
 - **Instrument names are guessed from the receipt** (program name, HTTP host). Two different tools that read the same source look independent unless tagged with the same `via=`.
 - **`http:` sends no credentials.** Authenticated endpoints need a `cmd:` receipt using a tool that reads credentials from the environment.
 - **`sh:` receipts run arbitrary shell.** They are off unless `--allow-shell` is given. See `SECURITY.md`.
+- **A baseline is only as good as the pre-change state it reaches.** `baseline=` sees tracked files at the ref plus anything in `keep=`. It does not see untracked build outputs, and it cannot rewind databases, services or anything outside the repository. A check that names a repository file by absolute path, or that finds a new test by discovery instead of by name, can be misjudged; prefer relative paths and name the test file. `before=` is a value you record, like `proves=config`.
 - **No effect size is claimed yet.** The eval harness has been tested on four synthetic transcripts only. The with/without protocol has not been run on real model output.
 
 ## Related work

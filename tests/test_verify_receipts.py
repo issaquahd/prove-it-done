@@ -396,6 +396,228 @@ class SaidAndJudgeTests(unittest.TestCase):
         self.assertIn("receipts 1, 2 failed", vr.judge(res, 1)[1])
 
 
+@unittest.skipIf(shutil.which("git") is None, "git not installed")
+class BaselineTests(unittest.TestCase):
+    """Fail before, pass after: HEAD~1 has a broken add(), HEAD fixes it."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.d = os.path.realpath(tempfile.mkdtemp())
+
+        def git(*a):
+            return subprocess.run(["git", "-C", cls.d, "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+                                   "-c", "commit.gpgsign=false"] + list(a),
+                                  check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout.decode().strip()
+        cls.git = staticmethod(git)
+
+        def write(name, text):
+            os.makedirs(os.path.dirname(os.path.join(cls.d, name)), exist_ok=True)
+            with open(os.path.join(cls.d, name), "w") as fh:
+                fh.write(text)
+        git("init", "-q")
+        write("calc.py", "def add(a, b):\n    return a - b\n")
+        write("test_add.py", "import calc, sys\nsys.exit(0 if calc.add(2, 2) == 4 else 1)\n")
+        # deliberately vacuous: passes whatever calc.py does
+        write("test_vacuous.py", "import sys\nsys.exit(0)\n")
+        write("sub/run.py", "import os, sys\nsys.path.insert(0, '..')\nimport calc\n"
+                            "sys.exit(0 if calc.add(1, 2) == 3 else 1)\n")
+        git("add", ".")
+        git("commit", "-q", "-m", "broken add")
+        cls.old_sha = hashlib.sha256(b"def add(a, b):\n    return a - b\n").hexdigest()
+        write("calc.py", "def add(a, b):\n    return a + b\n")
+        cls.new_sha = hashlib.sha256(b"def add(a, b):\n    return a + b\n").hexdigest()
+        git("commit", "-q", "-am", "fix add")
+        cls.head = git("rev-parse", "HEAD")
+        # a test written in the same change, not committed, so it is absent at every ref
+        write("test_new.py", "import calc, sys\nsys.exit(0 if calc.add(5, 5) == 10 else 1)\n")
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.d, ignore_errors=True)
+
+    def setUp(self):
+        self.old_cwd = os.getcwd()
+        os.chdir(self.d)
+
+    def tearDown(self):
+        os.chdir(self.old_cwd)
+
+    def baseline(self, spec, **kw):
+        r = vr.parse_spec(spec)
+        ok, _ = vr.check(r, **kw)
+        return vr.check_baseline(r, ok, **kw)
+
+    def cmd(self, script, *opts):
+        return " | ".join(["cmd:%s %s" % (PY, script)] + list(opts))
+
+    def test_proven_fails_before_passes_after(self):
+        verdict, msg = self.baseline(self.cmd("test_add.py", "baseline=HEAD~1"))
+        self.assertEqual(verdict, vr.PROVEN, msg)
+        self.assertIn("fails before the change, passes after", msg)
+
+    def test_vacuous_passes_before_and_after(self):
+        verdict, msg = self.baseline(self.cmd("test_vacuous.py", "baseline=HEAD~1"))
+        self.assertEqual(verdict, vr.VACUOUS, msg)
+        self.assertIn("not evidence", msg)
+
+    def test_broken_fails_after(self):
+        verdict, msg = self.baseline(self.cmd("-c \"import sys; sys.exit(1)\"", "baseline=HEAD~1"))
+        self.assertEqual(verdict, vr.BROKEN)
+        self.assertIn("fails after the change", msg)
+
+    def test_na_for_kinds_without_pre_change_state(self):
+        for spec in ("commit:%s | baseline=HEAD~1" % self.head, "said:worker says ok | baseline=HEAD~1"):
+            r = vr.parse_spec(spec)
+            self.assertEqual(vr.check_baseline(r, True)[0], vr.NA, spec)
+        r = vr.parse_spec("http:https://example.test/ | baseline=HEAD~1")
+        verdict, msg = vr.check_baseline(r, True)
+        self.assertEqual(verdict, vr.NA)
+        self.assertIn("no pre-change state", msg)
+
+    def test_unresolvable_ref_is_na_not_proven(self):
+        verdict, msg = self.baseline(self.cmd("test_add.py", "baseline=no-such-ref"))
+        self.assertEqual(verdict, vr.NA)
+        self.assertIn("proves nothing", msg)
+
+    def test_bad_ref_rejected(self):
+        verdict, msg = self.baseline(self.cmd("test_add.py", "baseline=--all"))
+        self.assertEqual(verdict, vr.NA)
+        self.assertIn("bad receipt", msg)
+
+    def test_new_check_without_keep_is_na(self):
+        # absent at HEAD~1, the new test would fail there only because it does not exist
+        verdict, msg = self.baseline(self.cmd("test_new.py", "baseline=HEAD~1"))
+        self.assertEqual(verdict, vr.NA)
+        self.assertIn("keep=test_new.py", msg)
+
+    def test_keep_runs_new_check_against_old_code(self):
+        verdict, msg = self.baseline(self.cmd("test_new.py", "baseline=HEAD~1", "keep=test_new.py"))
+        self.assertEqual(verdict, vr.PROVEN, msg)
+        # kept into a baseline where the code is already fixed: vacuous
+        verdict, msg = self.baseline(self.cmd("test_new.py", "baseline=HEAD", "keep=test_new.py"))
+        self.assertEqual(verdict, vr.VACUOUS, msg)
+
+    def test_absolute_path_into_repo_is_na(self):
+        verdict, msg = self.baseline(self.cmd(os.path.join(self.d, "test_add.py").replace("\\", "/"),
+                                              "baseline=HEAD~1"))
+        self.assertEqual(verdict, vr.NA)
+        self.assertIn("absolute path", msg)
+
+    def test_subdirectory_maps_into_worktree(self):
+        os.chdir(os.path.join(self.d, "sub"))
+        verdict, msg = self.baseline(self.cmd("run.py", "baseline=HEAD~1"))
+        self.assertEqual(verdict, vr.PROVEN, msg)
+
+    def test_sh_baseline(self):
+        spec = "sh:%s test_vacuous.py | baseline=HEAD~1" % PY
+        self.assertEqual(self.baseline(spec, allow_shell=True)[0], vr.VACUOUS)
+
+    def test_file_against_git_ref(self):
+        self.assertEqual(self.baseline("file:calc.py | sha256=%s | baseline=HEAD~1" % self.new_sha)[0], vr.PROVEN)
+        # existence alone held before the change
+        self.assertEqual(self.baseline("file:calc.py | baseline=HEAD~1")[0], vr.VACUOUS)
+        self.assertEqual(self.baseline("dir:sub | baseline=HEAD~1")[0], vr.VACUOUS)
+
+    def test_file_outside_repo_is_na(self):
+        outside = tempfile.mkdtemp()
+        try:
+            verdict, msg = self.baseline("dir:%s | baseline=HEAD~1" % outside.replace("\\", "/"))
+        finally:
+            shutil.rmtree(outside)
+        self.assertEqual(verdict, vr.NA)
+        self.assertIn("outside the repository", msg)
+
+    def test_before_recorded_state(self):
+        self.assertEqual(self.baseline("file:test_new.py | before=absent")[0], vr.PROVEN)
+        self.assertEqual(self.baseline("file:calc.py | before=present")[0], vr.VACUOUS)
+        self.assertEqual(self.baseline("file:calc.py | sha256=%s | before=%s" % (self.new_sha, self.old_sha))[0],
+                         vr.PROVEN)
+        self.assertEqual(self.baseline("file:calc.py | sha256=%s | before=%s" % (self.new_sha, self.new_sha))[0],
+                         vr.VACUOUS)
+        self.assertEqual(self.baseline("dir:sub | before=present")[0], vr.VACUOUS)
+        self.assertEqual(self.baseline("dir:sub | before=absent")[0], vr.PROVEN)
+
+    def test_bad_before_is_na(self):
+        for spec in ("file:calc.py | before=sometimes", "dir:sub | before=%s" % self.old_sha,
+                     "file:calc.py | sha256=%s | before=present" % self.new_sha,
+                     self.cmd("test_add.py", "before=absent")):
+            verdict, msg = self.baseline(spec)
+            self.assertEqual(verdict, vr.NA, spec)
+            self.assertIn("bad receipt", msg)
+
+    def test_parse_rules(self):
+        with self.assertRaises(vr.SpecError):
+            vr.parse_spec("file:calc.py | baseline=HEAD~1 | before=absent")
+        with self.assertRaises(vr.SpecError):
+            vr.parse_spec("cmd:true | keep=test_new.py")
+
+    def test_worktree_removed(self):
+        self.baseline(self.cmd("test_add.py", "baseline=HEAD~1"))
+        self.assertEqual(len(self.git("worktree", "list").splitlines()), 1)
+
+    def test_main_prints_vacuous_and_summary(self):
+        rc, out = run_main([self.cmd("test_add.py", "baseline=HEAD~1"), self.cmd("test_vacuous.py", "baseline=HEAD~1")])
+        self.assertEqual(rc, 0)  # the PROVEN receipt still proves the claim; the vacuous one is not counted
+        self.assertIn("VACUOUS  [2]", out)
+        self.assertIn("receipt 2 VACUOUS, not counted", out)
+        self.assertIn("baseline: 1 proven, 1 vacuous, 0 broken, 0 n/a", out)
+
+    def test_main_vacuous_only_is_unproven(self):
+        rc, out = run_main([self.cmd("test_vacuous.py", "baseline=HEAD~1")])
+        self.assertEqual(rc, 1)
+        self.assertIn("only VACUOUS behaviour receipts passed", out)
+
+    def test_main_require_baseline(self):
+        add, vac = self.cmd("test_add.py", "baseline=HEAD~1"), self.cmd("test_vacuous.py", "baseline=HEAD~1")
+        self.assertEqual(run_main(["--require-baseline", add])[0], 0)
+        rc, out = run_main(["--require-baseline", add, vac])
+        self.assertEqual(rc, 1)
+        self.assertIn("receipt 2 VACUOUS", out)
+        # a receipt with no baseline, or an N/A one, is never upgraded to a baseline
+        rc, out = run_main(["--require-baseline", self.cmd("test_add.py"), self.cmd("test_new.py", "baseline=HEAD~1")])
+        self.assertEqual(rc, 1)
+        self.assertIn("N/A", out)
+        self.assertIn("no behaviour receipt was shown to fail before the change", out)
+
+    def test_ledger_without_baselines_is_unchanged(self):
+        rc, out = run_main([self.cmd("test_add.py")])
+        self.assertEqual(rc, 0)
+        self.assertNotIn("baseline", out)
+
+
+class BaselineJudgeTests(unittest.TestCase):
+    def _res(self, *rows):
+        return [(vr.parse_spec(s), ok, "", v) for s, ok, v in rows]
+
+    def test_vacuous_is_not_evidence(self):
+        proven, reason = vr.judge(self._res(("cmd:true", True, vr.VACUOUS)), 1)
+        self.assertFalse(proven)
+        self.assertIn("only VACUOUS", reason)
+
+    def test_vacuous_does_not_count_as_an_instrument(self):
+        res = self._res(("cmd:true", True, vr.PROVEN), ("cmd:kubectl get pods", True, vr.VACUOUS))
+        self.assertTrue(vr.judge(res, 1)[0])
+        self.assertFalse(vr.judge(res, 2)[0])
+
+    def test_require_baseline(self):
+        self.assertTrue(vr.judge(self._res(("cmd:true", True, vr.PROVEN)), 1, True)[0])
+        for v in (None, vr.NA):
+            proven, reason = vr.judge(self._res(("http:https://a.example.test/", True, v)), 1, True)
+            self.assertFalse(proven)
+            self.assertIn("--require-baseline", reason)
+        res = self._res(("cmd:true", True, vr.PROVEN), ("cmd:other", True, vr.VACUOUS))
+        self.assertIn("receipt 2 VACUOUS", vr.judge(res, 1, True)[1])
+
+    def test_config_baseline_does_not_satisfy_require(self):
+        res = self._res(("file:app.yaml | proves=config", True, vr.PROVEN), ("http:https://a.example.test/", True, vr.NA))
+        self.assertFalse(vr.judge(res, 1, True)[0])
+
+    def test_broken_is_a_failure(self):
+        proven, reason = vr.judge(self._res(("cmd:true", False, vr.BROKEN)), 1)
+        self.assertFalse(proven)
+        self.assertIn("receipt 1 failed", reason)
+
+
 LEDGER = """# Ledger: release 2.1.0
 
 - [x] 1. Build artifact
@@ -477,6 +699,9 @@ class UsageTests(unittest.TestCase):
 
     def test_unknown_option(self):
         self.assertEqual(run_main(["--nope", "file:x"])[0], 2)
+
+    def test_baseline_and_before_together_is_a_parse_error(self):
+        self.assertEqual(run_main(["file:x | baseline=HEAD~1 | before=absent"])[0], 2)
 
 
 if __name__ == "__main__":

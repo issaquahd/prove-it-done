@@ -9,6 +9,7 @@
 - **`http:` receipts** make one GET request to an `http` or `https` URL, following redirects only to `http` or `https` URLs, with Python's default TLS verification, no cookies and no credentials. Other URL schemes are refused. A receipt can still point at internal addresses reachable from your machine (for example cloud metadata endpoints), so review URLs in ledgers you did not write.
 - **`commit:` receipts** run read-only git commands (`cat-file`, `show`, `merge-base`). The hash must be hex and a `branch=` value may not start with `-`, so receipts cannot inject git options.
 - **`file:` and `dir:` receipts** only read metadata and file contents (for `sha256=`).
+- **`baseline=REF`** runs the receipt a second time, in a temporary detached git worktree created under the system temp directory. The verifier runs `git worktree add` with repository hooks disabled, copies any `keep=` paths into it, and removes it with `git worktree remove --force` and `git worktree prune` afterwards. The ref may not start with `-` or contain whitespace. A `cmd:` or `sh:` receipt with a baseline runs twice, so it should be safe to run twice.
 
 Every receipt runs with standard input closed and a timeout (default 60 seconds, `--timeout` or `| timeout=S`).
 
@@ -25,4 +26,4 @@ Every receipt runs with standard input closed and a timeout (default 60 seconds,
 
 Please report security problems privately through GitHub's "Report a vulnerability" (private security advisory) on this repository, rather than in a public issue. Include the receipt or ledger that triggers the problem, what you expected, and what happened. You should get an acknowledgement within a week.
 
-Issues in scope: a receipt that causes the verifier to run something other than what its kind documents (for example shell execution from a `cmd:` receipt), a secret printed despite matching a documented redaction pattern, git option injection, or a check that reports PASS when it errored.
+Issues in scope: a receipt that causes the verifier to run something other than what its kind documents (for example shell execution from a `cmd:` receipt), a secret printed despite matching a documented redaction pattern, git option injection, a check that reports PASS when it errored, or a baseline reported PROVEN when the baseline run errored.

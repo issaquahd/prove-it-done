@@ -30,6 +30,32 @@ Options that apply to every kind:
 - `via=NAME` names the instrument. Use it when the default would hide that two receipts observe through the same thing (two different binaries that both read the same cache), or would split one instrument into two.
 - `proves=config` marks a receipt that reads configuration or desired state rather than behaviour. A done step needs at least one passing receipt that is not `proves=config`.
 
+## Baselines (fail before, pass after)
+
+A receipt that passes on the state before the change would pass with no change at all, so it is not evidence of the change. These options make the verifier check that too:
+
+| Option | Kinds | What the verifier does |
+| --- | --- | --- |
+| `baseline=REF` | `cmd:`, `sh:`, `file:`, `dir:` | Creates a temporary, detached git worktree at `REF` (any commit-ish: `HEAD` for uncommitted work, `HEAD~1` after committing) of the repository that holds the current directory, with hooks disabled. It runs the same receipt there from the same relative directory, with `file:` and `dir:` paths mapped into the worktree, then removes the worktree. |
+| `keep=PATH[,PATH]` | with `baseline=` | Copies these files or directories (relative to the current directory, inside the repository) from the current tree into the worktree before the run, so a test written in the change runs against the old code. |
+| `before=STATE` | `file:`, `dir:` | Uses a recorded pre-change state instead of git: `absent`, `present`, or the file's old SHA-256. |
+
+Verdicts, printed after the receipt's own result:
+
+- **PROVEN**: fails before the change, passes after. The receipt is evidence of the change.
+- **VACUOUS**: passes before and after. The line is tagged `VACUOUS` and the receipt is not counted as evidence or toward `--min-instruments`.
+- **BROKEN**: fails after the change. The receipt is a FAIL, as without a baseline.
+- **N/A**: no baseline was possible. `http:`, `commit:` and `said:` have no pre-change state to re-check. A baseline run that errors (unknown ref, checkout failure, timeout, missing program) is also N/A: a check that errors proves nothing, so an errored baseline is never read as "fails before". The receipt counts as it would without a baseline and never as PROVEN.
+
+Two cases are reported N/A because they would otherwise look PROVEN or VACUOUS for the wrong reason:
+
+- the command names a file that exists now but not at `REF` (a test written in the change), and `keep=` does not carry it: the baseline would only show that the test did not exist yet;
+- the command names a repository file by absolute path: the baseline run would read the current tree.
+
+`--require-baseline` makes a done step PROVEN only when at least one passing behaviour receipt is PROVEN against its baseline and no receipt in the step is VACUOUS. When any receipt has a baseline, the run ends with `baseline: N proven, N vacuous, N broken, N n/a`.
+
+Limits: the worktree has tracked files at `REF` plus `keep=` paths, and no untracked build outputs or installed state. A baseline cannot rewind a database, a service or anything outside the repository; for those, record `before=` or accept N/A. A test found by discovery (`python -m unittest discover`) rather than named on the command line is not detected as new; name it, or `keep=` its directory.
+
 ## Instruments
 
 The verifier derives an instrument for each receipt unless `via=` is given:
