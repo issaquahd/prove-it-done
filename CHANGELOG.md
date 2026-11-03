@@ -4,6 +4,10 @@ All notable changes to this project are listed here. The format follows [Keep a 
 
 ## [Unreleased]
 
+### Added
+
+- Baseline check (fail before, pass after): `baseline=REF` re-runs a `cmd:`, `sh:`, `file:` or `dir:` receipt in a temporary git worktree at `REF`, with `keep=PATH[,PATH]` to carry a new test into it; `before=absent|present|SHA256` records the pre-change state of a `file:` or `dir:`. Each such receipt gets a verdict: PROVEN (fails before, passes after), VACUOUS (passes before and after; not counted as evidence), BROKEN (fails after) or N/A (`http:`, `commit:`, `said:`, or the baseline run errored; never counted as a baseline). A new test that is missing at `REF` without `keep=` is N/A, not PROVEN. `--require-baseline` makes a done step PROVEN only with at least one PROVEN behaviour receipt and no VACUOUS one. Based on the empty-patch grader check in Sandman (arXiv 2610.39711). Receipts without these options behave and print as before.
+
 ## [0.1.0] - 2026-10-11
 
 ### Added

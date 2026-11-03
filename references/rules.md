@@ -80,6 +80,19 @@ Each rule below comes from a way that a "done" turned out to be false in practic
 
 **What the verifier does.** `--reopen` rewrites each unproven done step into `- ~~[x] N. claim~~ reopened DATE: reason` plus a fresh `- [ ] N. claim`, and keeps every receipt line. If a receipt was wrong, change the claim to match what the receipt can prove, and say so in your report.
 
+## Related to rules 4 and 5: a receipt must be able to fail
+
+**Habit.** Before a passing receipt counts as evidence of a change, show that it fails without the change.
+
+**Why.** A check that cannot fail tells you nothing about the change. A test that always exits 0, a `contains=` that matches text which was already there, a `file:` that existed before: each passes after the change and would have passed without it. Training pipelines for coding agents found the same problem in their graders and now run every grader on an empty patch, which must fail (Sandman, arXiv 2610.39711).
+
+**How it gets broken.**
+- Writing a new test in the same change and counting it as proof, when it would pass on the old code too.
+- A `contains=` value that appears in the output both before and after.
+- Checking that a file exists when it existed before the change.
+
+**What the verifier does.** `| baseline=REF` re-runs `cmd:`, `sh:`, `file:` and `dir:` receipts in a git worktree at `REF`, and `| before=` records a file's pre-change state. A receipt that passes before and after is VACUOUS and does not count. `--require-baseline` makes a done step need a receipt that failed before the change. Details are in `receipts.md`.
+
 ## A seventh habit: size the claim to the receipt
 
 Not a rule the verifier enforces, but the one that makes the others easy: say exactly what the receipts show. "The version endpoint on staging returns 2.1.0" is a claim a receipt can prove. "The release went well" is not. If the receipt you can write is narrower than the claim you wanted to make, narrow the claim.

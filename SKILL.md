@@ -47,6 +47,8 @@ Use one Markdown file per task (for example `receipts.md`). Each step is a numbe
 
 Kinds: `cmd:` (argv, no shell), `sh:` (shell string, needs `--allow-shell`), `file:` (exists, optional `sha256=`), `dir:`, `http:` (status, optional `contains=`), `commit:` (exists, optional `path=`, `branch=`), and `said:` for recording a self-report. Tag receipts that only read configuration or desired state with `| proves=config`.
 
+For a code change, show that the receipt can fail: add `| baseline=HEAD` (or `HEAD~1` once committed) so the verifier also runs it against the pre-change tree, and `| keep=PATH` when the test itself is new. A receipt that passes before the change too is VACUOUS and does not count. For a `file:` or `dir:` with no git history, record `| before=absent` or the old SHA-256. Use `--require-baseline` when a claim must rest on a receipt that failed before the change.
+
 Done when: `python3 scripts/verify_receipts.py --ledger receipts.md --list` prints every step and receipt with no parse error.
 
 ### 4. Record self-reports as `said:`, then go and check

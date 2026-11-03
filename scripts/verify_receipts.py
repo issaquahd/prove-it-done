@@ -14,6 +14,8 @@ Options:
   --timeout N          default per-receipt timeout in seconds (default 60)
   --allow-shell        permit sh: receipts (they run through the system shell)
   --min-instruments N  a claim needs passing behaviour receipts from N distinct instruments (default 1)
+  --require-baseline   a claim needs a behaviour receipt that fails before the change and passes
+                       after it, and any VACUOUS receipt makes the claim unproven
   --list               parse and print the receipts without running them
 
 Receipt spec:  KIND:TARGET [ | key=value ]...
@@ -35,6 +37,18 @@ Options for every kind:
   via=NAME        name the instrument (default: derived from the receipt)
   proves=config   mark a receipt that only checks configuration, not behaviour
 
+Baseline (fail before, pass after): a receipt that already passes on the pre-change state
+is not evidence of the change.
+  baseline=REF    cmd:, sh:, file:, dir: run the same check again in a temporary git worktree
+                  at REF (for example HEAD~1); the repository is the one holding the current
+                  directory. keep=PATH[,PATH] copies files from the current tree into that
+                  worktree first, so a new test can run against the old code.
+  before=STATE    file:, dir: the recorded pre-change state: absent, present, or the file's
+                  old SHA-256
+  Baseline verdicts: PROVEN (fails before, passes after), VACUOUS (passes before and after:
+  not evidence), BROKEN (fails after), N/A (no baseline possible: http:, commit:, said:, or
+  the baseline check errored). N/A is never counted as a baseline.
+
 Exit status: 0 when every done step is proven (on the command line, every receipt
 passes), 1 otherwise, 2 on a usage or parse error. Receipts under open steps are run
 and printed but do not change the exit status. Command output is never printed, and every printed line
@@ -45,14 +59,17 @@ import hashlib
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
 
 KINDS = ("cmd", "sh", "file", "dir", "http", "commit", "said")
-OPTION_KEYS = ("rc", "contains", "timeout", "sha256", "status", "repo", "path", "branch", "via", "proves")
+OPTION_KEYS = ("rc", "contains", "timeout", "sha256", "status", "repo", "path", "branch", "via", "proves",
+               "baseline", "before", "keep")
 OPTION_SPLIT = re.compile(r"\s+\|\s+(?=(?:%s)=)" % "|".join(OPTION_KEYS))
 HEX_HASH = re.compile(r"^[0-9a-fA-F]{7,64}$")
 SHA256 = re.compile(r"^[0-9a-fA-F]{64}$")
@@ -105,6 +122,10 @@ class Receipt(object):
     def proves(self):
         return self.options.get("proves", "behaviour").lower()
 
+    @property
+    def wants_baseline(self):
+        return "baseline" in self.options or "before" in self.options
+
     def instrument(self):
         if "via" in self.options:
             return self.options["via"]
@@ -145,6 +166,10 @@ def parse_spec(spec):
         raise SpecError("proves= must be config or behaviour, got %r" % options["proves"])
     if options.get("proves", "").lower() == "behavior":
         options["proves"] = "behaviour"
+    if "baseline" in options and "before" in options:
+        raise SpecError("use baseline= or before=, not both")
+    if "keep" in options and "baseline" not in options:
+        raise SpecError("keep= needs baseline=")
     return Receipt(spec, kind, target, options)
 
 
@@ -157,7 +182,7 @@ def _timeout(receipt, default):
         raise SpecError("timeout= must be a number of seconds")
 
 
-def _run_process(receipt, default_timeout, allow_shell):
+def _run_process(receipt, default_timeout, allow_shell, cwd=None):
     if receipt.kind == "sh" and not allow_shell:
         return False, "sh: receipts run through the system shell; re-run with --allow-shell if you trust this ledger"
     timeout = _timeout(receipt, default_timeout)
@@ -177,7 +202,7 @@ def _run_process(receipt, default_timeout, allow_shell):
         popen_args = dict(args=receipt.target, shell=True)
     try:
         proc = subprocess.run(stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                              timeout=timeout, **popen_args)
+                              timeout=timeout, cwd=cwd, **popen_args)
     except subprocess.TimeoutExpired:
         return False, "error: timed out after %gs; a check that does not finish proves nothing" % timeout
     except OSError as e:
@@ -309,12 +334,12 @@ def _check_commit(receipt):
         return False, "error: git timed out; a check that errors proves nothing"
 
 
-def check(receipt, default_timeout=60.0, allow_shell=False):
+def check(receipt, default_timeout=60.0, allow_shell=False, cwd=None):
     """Run one receipt now. Returns (ok, message); ok is None for said: lines, which are
     recorded claims, not checks. Never raises for a failing system."""
     try:
         if receipt.kind in ("cmd", "sh"):
-            return _run_process(receipt, default_timeout, allow_shell)
+            return _run_process(receipt, default_timeout, allow_shell, cwd)
         if receipt.kind in ("file", "dir"):
             return _check_file(receipt)
         if receipt.kind == "http":
@@ -328,6 +353,145 @@ def check(receipt, default_timeout=60.0, allow_shell=False):
     except Exception as e:  # an unexpected error in the check is not a pass
         return False, "error: %s; a check that errors proves nothing" % e.__class__.__name__
     return False, "unknown receipt kind"
+
+
+# ------------------------------------------------------------------ baseline
+
+PROVEN, VACUOUS, BROKEN, NA = "PROVEN", "VACUOUS", "BROKEN", "N/A"
+
+
+def _is_error(msg):
+    return msg.startswith("error:") or msg.startswith("bad receipt")
+
+
+def _before_state(receipt):
+    """Judge a file:/dir: receipt against its recorded before= state. Returns (ok, msg)."""
+    state = receipt.options["before"].strip().lower()
+    if state == "absent":
+        return False, "absent before the change"
+    if receipt.kind == "dir":
+        if state == "present":
+            return True, "present before the change"
+        raise SpecError("before= for dir: must be absent or present")
+    if state == "present":
+        if "sha256" in receipt.options:
+            raise SpecError("before=present cannot be compared with sha256=; record the old SHA-256")
+        return True, "present before the change"
+    if not SHA256.match(state):
+        raise SpecError("before= for file: must be absent, present or 64 hex characters")
+    if "sha256" not in receipt.options:
+        return True, "present before the change"
+    if state == receipt.options["sha256"].lower():
+        return True, "same sha256 before the change"
+    return False, "sha256 was %s... before the change" % state[:12]
+
+
+def _inside(path, top):
+    rel = os.path.relpath(path, top)
+    return rel != os.pardir and not rel.startswith(os.pardir + os.sep) and not os.path.isabs(rel)
+
+
+def _worktree_baseline(receipt, default_timeout, allow_shell):
+    """Re-run a cmd:/sh:/file:/dir: receipt in a temporary worktree at baseline=REF.
+    Returns (ok, msg); ok is None when the baseline could not be checked."""
+    ref = receipt.options["baseline"]
+    if not ref or ref.startswith("-") or re.search(r"\s", ref):
+        raise SpecError("baseline= must be a git ref")
+    cwd = os.getcwd()
+    top = _git(cwd, "rev-parse", "--show-toplevel")
+    if top.returncode != 0:
+        return None, "the current directory is not in a git repository"
+    top = os.path.realpath(top.stdout.decode().strip())
+    sha = _git(top, "rev-parse", "--verify", "--quiet", ref + "^{commit}")
+    if sha.returncode != 0:
+        return None, "error: could not resolve %s; a check that errors proves nothing" % ref
+    sha = sha.stdout.decode().strip()
+    rel_cwd = os.path.relpath(os.path.realpath(cwd), top)
+
+    keep = [k.strip() for k in receipt.options.get("keep", "").split(",") if k.strip()]
+    for k in keep:
+        if os.path.isabs(k) or not _inside(os.path.realpath(k), top):
+            raise SpecError("keep= paths must be relative and inside the repository")
+        if not os.path.exists(k):
+            return None, "error: keep=%s does not exist; a check that errors proves nothing" % k
+
+    # Paths the check reads must be resolvable in the worktree, not in the current tree.
+    if receipt.kind in ("file", "dir"):
+        path = os.path.realpath(os.path.expanduser(receipt.target))
+        if not _inside(path, top):
+            return None, "%s is outside the repository" % receipt.target
+        words = []
+    else:
+        try:
+            words = shlex.split(receipt.target)
+        except ValueError:
+            words = receipt.target.split()
+        words = [w for w in words if not os.path.isabs(w) or _inside(os.path.realpath(w), top)]
+
+    parent = tempfile.mkdtemp(prefix="prove-it-done-baseline-")
+    wt = os.path.join(parent, "wt")
+    hooks = os.path.join(parent, "no-hooks")
+    os.mkdir(hooks)
+    try:
+        add = _git(top, "-c", "core.hooksPath=" + hooks, "worktree", "add", "--detach", "-q", wt, sha)
+        if add.returncode != 0:
+            return None, "error: could not check out %s; a check that errors proves nothing" % ref
+        wt_cwd = os.path.normpath(os.path.join(wt, rel_cwd))
+        for k in keep:
+            src, dst = os.path.join(cwd, k), os.path.join(wt_cwd, k)
+            if os.path.isdir(src):
+                shutil.copytree(src, dst, dirs_exist_ok=True)
+            else:
+                os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
+                shutil.copy2(src, dst)
+        if receipt.kind in ("file", "dir"):
+            mapped = os.path.join(wt, os.path.relpath(path, top))
+            target = Receipt(receipt.spec, receipt.kind, mapped, receipt.options)
+            return check(target, default_timeout, allow_shell)
+        if not os.path.isdir(wt_cwd):
+            return None, "directory %s does not exist at %s" % (rel_cwd, ref)
+        for w in words:
+            if os.path.isabs(w):
+                # a repository file named by absolute path would be read from the current tree
+                if os.path.isfile(w) and _git(top, "check-ignore", "-q", w).returncode != 0:
+                    return None, ("the check names %s by absolute path, so a baseline run would read "
+                                  "the current tree; use a path relative to the current directory" % w)
+            elif os.path.isfile(w) and not os.path.exists(os.path.join(wt_cwd, w)):
+                return None, ("the check uses %s, which does not exist at %s; add keep=%s to run the "
+                              "new check against the old code" % (w, ref, w))
+        return check(receipt, default_timeout, allow_shell, cwd=wt_cwd)
+    finally:
+        _git(top, "worktree", "remove", "--force", wt)
+        shutil.rmtree(parent, ignore_errors=True)
+        _git(top, "worktree", "prune")
+
+
+def check_baseline(receipt, ok, default_timeout=60.0, allow_shell=False):
+    """Judge a receipt that asked for a baseline (baseline= or before=) against the
+    pre-change state. ok is the receipt's result now. Returns (verdict, message)."""
+    if ok is False:
+        return BROKEN, "fails after the change"
+    if receipt.kind in ("http", "commit", "said"):
+        return NA, "%s: receipts have no pre-change state to re-check" % receipt.kind
+    try:
+        if "before" in receipt.options:
+            if receipt.kind not in ("file", "dir"):
+                raise SpecError("before= applies to file: and dir: only; use baseline=REF")
+            before_ok, before_msg = _before_state(receipt)
+            where = "recorded"
+        else:
+            before_ok, before_msg = _worktree_baseline(receipt, default_timeout, allow_shell)
+            where = receipt.options["baseline"]
+    except SpecError as e:
+        return NA, "bad receipt: %s" % e
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return NA, "error: %s; a check that errors proves nothing" % e.__class__.__name__
+    if before_ok is None or (before_ok is False and _is_error(before_msg)):
+        return NA, "baseline %s not checked: %s" % (where, before_msg)
+    if before_ok:
+        return VACUOUS, "baseline %s: %s; it passes before the change too, so it is not evidence" % (
+            where, before_msg)
+    return PROVEN, "baseline %s: %s; fails before the change, passes after" % (where, before_msg)
 
 
 # ------------------------------------------------------------------ ledger
@@ -359,26 +523,44 @@ def parse_ledger(text):
     return steps
 
 
-def judge(results, min_instruments):
-    """results: list of (Receipt, ok, msg). Returns (proven, reason)."""
+def _numbers(label, idx):
+    return "%s %s" % (label if len(idx) == 1 else label + "s", ", ".join(str(i) for i in idx))
+
+
+def judge(results, min_instruments, require_baseline=False):
+    """results: list of (Receipt, ok, msg) or (Receipt, ok, msg, baseline_verdict), where
+    baseline_verdict is None for a receipt that asked for no baseline. Returns (proven, reason)."""
     if not results:
         return False, "no receipts"
-    failed = [i for i, (_, ok, _) in enumerate(results, 1) if ok is False]
+    results = [tuple(x) + (None,) * (4 - len(x)) for x in results]
+    failed = [i for i, x in enumerate(results, 1) if x[1] is False]
     if failed:
-        return False, "%s %s failed" % ("receipt" if len(failed) == 1 else "receipts",
-                                         ", ".join(str(i) for i in failed))
+        return False, "%s failed" % _numbers("receipt", failed)
+    vacuous = [i for i, x in enumerate(results, 1) if x[3] == VACUOUS]
     results = [x for x in results if x[0].kind != "said"]
     if not results:
         return False, "only self-reports; a claim is not evidence"
-    behaviour = [r for r, ok, _ in results if ok and r.proves != "config"]
+    if require_baseline and vacuous:
+        return False, "%s VACUOUS: passes before the change too, so it is not evidence" % _numbers(
+            "receipt", vacuous)
+    behaviour = [(r, v) for r, ok, _, v in results if ok and r.proves != "config" and v != VACUOUS]
     if not behaviour:
+        if vacuous:
+            return False, "only VACUOUS behaviour receipts passed; a receipt that passes before the change is not evidence"
         return False, "only config receipts passed; a config check is not a behaviour check"
-    instruments = sorted(set(r.instrument() for r in behaviour))
+    instruments = sorted(set(r.instrument() for r, _ in behaviour))
     if len(instruments) < min_instruments:
         return False, "%d behaviour receipt(s) through %d instrument(s) (%s); need %d distinct" % (
             len(behaviour), len(instruments), ", ".join(instruments), min_instruments)
-    return True, "%d receipt(s); behaviour checked through %d instrument(s): %s" % (
-        len(results), len(instruments), ", ".join(instruments))
+    baselined = sum(1 for _, v in behaviour if v == PROVEN)
+    if require_baseline and not baselined:
+        return False, ("no behaviour receipt was shown to fail before the change; "
+                       "--require-baseline needs one with baseline= or before=")
+    note = "; %d failed before the change" % baselined if baselined else ""
+    if vacuous:
+        note += "; %s VACUOUS, not counted" % _numbers("receipt", vacuous)
+    return True, "%d receipt(s); behaviour checked through %d instrument(s): %s%s" % (
+        len(results), len(instruments), ", ".join(instruments), note)
 
 
 def reopen(text, step_numbers_reasons, today=None):
@@ -397,8 +579,12 @@ def reopen(text, step_numbers_reasons, today=None):
 
 # ------------------------------------------------------------------ main
 
-def _print_receipt(idx, receipt, ok, msg):
+def _print_receipt(idx, receipt, ok, msg, baseline=None):
     tag = "CLAIM" if ok is None else ("PASS" if ok else "FAIL")
+    if baseline is not None:
+        verdict, why = baseline
+        tag = "VACUOUS" if verdict == VACUOUS else tag
+        msg = "%s; %s: %s" % (msg, verdict, why)
     extra = " [config]" if receipt.proves == "config" else ""
     print(redact("%s  [%d] %s%s -- %s (via %s)" % (tag, idx, receipt.spec, extra, msg, receipt.instrument())))
 
@@ -406,6 +592,7 @@ def _print_receipt(idx, receipt, ok, msg):
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     timeout, allow_shell, min_inst, list_only, do_reopen, ledger = 60.0, False, 1, False, False, None
+    require_baseline = False
     specs = []
     it = iter(argv)
     try:
@@ -416,6 +603,8 @@ def main(argv=None):
                 allow_shell = True
             elif a == "--min-instruments":
                 min_inst = int(next(it))
+            elif a == "--require-baseline":
+                require_baseline = True
             elif a == "--list":
                 list_only = True
             elif a == "--reopen":
@@ -461,6 +650,7 @@ def main(argv=None):
         return 0
 
     n_pass = n_fail = 0
+    verdicts = {PROVEN: 0, VACUOUS: 0, BROKEN: 0, NA: 0}
     unproven = {}
     idx = 0
     for s in steps:
@@ -472,9 +662,12 @@ def main(argv=None):
             ok, msg = check(r, timeout, allow_shell)
             n_pass += ok is True
             n_fail += ok is False
-            results.append((r, ok, msg))
-            _print_receipt(idx, r, ok, msg)
-        proven, reason = judge(results, min_inst)
+            baseline = check_baseline(r, ok, timeout, allow_shell) if r.wants_baseline else None
+            if baseline is not None:
+                verdicts[baseline[0]] += 1
+            results.append((r, ok, msg, baseline and baseline[0]))
+            _print_receipt(idx, r, ok, msg, baseline)
+        proven, reason = judge(results, min_inst, require_baseline)
         if s.done:
             print(redact("  -> %s: %s" % ("PROVEN" if proven else "UNPROVEN", reason)))
             if not proven:
@@ -484,6 +677,9 @@ def main(argv=None):
     done_steps = sum(1 for s in steps if s.done)
     print("summary: %d pass, %d fail; %d of %d done step(s) proven" % (
         n_pass, n_fail, done_steps - len(unproven), done_steps))
+    if any(verdicts.values()):
+        print("baseline: %d proven, %d vacuous, %d broken, %d n/a" % (
+            verdicts[PROVEN], verdicts[VACUOUS], verdicts[BROKEN], verdicts[NA]))
     if do_reopen and unproven:
         with open(ledger, "w", encoding="utf-8") as fh:
             fh.write(reopen(text, unproven))
