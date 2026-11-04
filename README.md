@@ -106,7 +106,7 @@ With `--require-baseline`, step 1 is also UNPROVEN (`receipt 2 VACUOUS: passes b
 ## Limits
 
 - **It is a skill, not a gate.** Nothing stops an agent from skipping it. Hook-based projects (see `references/prior-art.md`) enforce harder. The verifier's exit status can be wired into a hook or CI step if you want enforcement.
-- **The verifier checks receipts, not whether they are the right receipts.** A passing `file:` receipt for a claim about live traffic is the wrong instrument, and the verifier cannot tell. `proves=config` and `via=` are labels the agent applies honestly or not.
+- **The verifier checks receipts, not whether they are the right receipts.** A passing `file:` receipt for a claim about live traffic is the wrong instrument, and the verifier cannot tell. A `- target:` line catches a receipt on the wrong object (`web-canary` for `web`) only when the step names its target; the match is on names, not on what the object really is. `proves=config` and `via=` are labels the agent applies honestly or not.
 - **Instrument names are guessed from the receipt** (program name, HTTP host). Two different tools that read the same source look independent unless tagged with the same `via=`.
 - **`http:` sends no credentials.** Authenticated endpoints need a `cmd:` receipt using a tool that reads credentials from the environment.
 - **`sh:` receipts run arbitrary shell.** They are off unless `--allow-shell` is given. See `SECURITY.md`.

@@ -16,6 +16,7 @@ Options:
   --min-instruments N  a claim needs passing behaviour receipts from N distinct instruments (default 1)
   --require-baseline   a claim needs a behaviour receipt that fails before the change and passes
                        after it, and any VACUOUS receipt makes the claim unproven
+  --target CLAIM       the object the claim is about (see "Claimed target" below); command line only
   --list               parse and print the receipts without running them
 
 Receipt spec:  KIND:TARGET [ | key=value ]...
@@ -24,7 +25,8 @@ Receipt spec:  KIND:TARGET [ | key=value ]...
                   options: rc=N  contains=TEXT  timeout=S
   sh:STRING       run STRING through the system shell; needs --allow-shell (see SECURITY.md)
                   options: rc=N  contains=TEXT  timeout=S
-  file:PATH       PATH is a regular file; options: sha256=HEX
+  file:PATH       PATH is a regular file; options: sha256=HEX (sha256= works only on file:; a
+                  listing, a size or an exit code is not a checksum)
   dir:PATH        PATH is a directory
   http:URL        GET URL (http or https); PASS on any 2xx unless status= is given
                   options: status=200[,204]  contains=TEXT  timeout=S
@@ -36,6 +38,16 @@ Receipt spec:  KIND:TARGET [ | key=value ]...
 Options for every kind:
   via=NAME        name the instrument (default: derived from the receipt)
   proves=config   mark a receipt that only checks configuration, not behaviour
+  target=NAME     the object this receipt is about. NAME must be what the check reads (a word
+                  of the command, the path, or the URL host or path), or the receipt FAILs:
+                  "cmd:svc status web-canary | target=web" checks web-canary, not web.
+
+Claimed target: a done step may name the object it claims with a line under the step,
+  "- target: NAME" (or --target NAME on the command line). Then only behaviour receipts
+  about NAME count: one with target=NAME, or with no target= and NAME as a word of its check.
+  A receipt about another object is printed and not counted. "- target: NAME | needs=sha256"
+  also needs a passing file: receipt on NAME with sha256=: a listing (name and size) or an
+  existence check does not show the content is right.
 
 Baseline (fail before, pass after): a receipt that already passes on the pre-change state
 is not evidence of the change.
@@ -69,7 +81,8 @@ import urllib.request
 
 KINDS = ("cmd", "sh", "file", "dir", "http", "commit", "said")
 OPTION_KEYS = ("rc", "contains", "timeout", "sha256", "status", "repo", "path", "branch", "via", "proves",
-               "baseline", "before", "keep")
+               "baseline", "before", "keep", "target")
+NEEDS = ("sha256",)
 OPTION_SPLIT = re.compile(r"\s+\|\s+(?=(?:%s)=)" % "|".join(OPTION_KEYS))
 HEX_HASH = re.compile(r"^[0-9a-fA-F]{7,64}$")
 SHA256 = re.compile(r"^[0-9a-fA-F]{64}$")
@@ -170,7 +183,85 @@ def parse_spec(spec):
         raise SpecError("use baseline= or before=, not both")
     if "keep" in options and "baseline" not in options:
         raise SpecError("keep= needs baseline=")
+    if "sha256" in options and kind != "file":
+        raise SpecError("sha256= works only on file: receipts; a listing, a size or an exit code is not a checksum")
+    if "target" in options and not options["target"]:
+        raise SpecError("target= needs a name")
     return Receipt(spec, kind, target, options)
+
+
+# ------------------------------------------------------------------ targets
+
+def _norm_name(name):
+    n = name.strip().strip("'\"").replace("\\", "/")
+    while n.startswith("./"):
+        n = n[2:]
+    return n.rstrip("/") or n
+
+
+def _same_object(word, name):
+    """True when WORD (from a check) names NAME: equal, or a path ending in /NAME."""
+    w, n = _norm_name(word), _norm_name(name)
+    return w == n or w.endswith("/" + n)
+
+
+def check_words(receipt):
+    """The names a receipt's check reads: words of the command, the path, the URL host and
+    path, the commit and its path=."""
+    if receipt.kind in ("cmd", "sh"):
+        try:
+            words = shlex.split(receipt.target)
+        except ValueError:
+            words = receipt.target.split()
+        out = []
+        for w in words:
+            out.append(w)
+            out.extend(x for x in re.split(r"[=,]", w) if x and x != w)
+        return out
+    if receipt.kind == "http":
+        u = urllib.parse.urlsplit(receipt.target)
+        segs = [x for x in u.path.split("/") if x]
+        return [x for x in [u.hostname or "", u.path] + segs if x]
+    if receipt.kind == "commit":
+        return [receipt.target] + [receipt.options[k] for k in ("path", "repo") if k in receipt.options]
+    if receipt.kind in ("file", "dir"):
+        return [receipt.target]
+    return []
+
+
+def reads(receipt, name):
+    """True when the receipt's check reads NAME."""
+    return any(_same_object(w, name) for w in check_words(receipt))
+
+
+def about(receipt, name):
+    """True when the receipt is about NAME: its target= is NAME, or it has no target= and its
+    check reads NAME."""
+    if "target" in receipt.options:
+        return _norm_name(receipt.options["target"]) == _norm_name(name)
+    return reads(receipt, name)
+
+
+class Claim(object):
+    """The object a step claims, from "- target: NAME [| needs=sha256]"."""
+
+    def __init__(self, name, needs=None):
+        self.name = name
+        self.needs = needs
+
+
+def parse_claim(text):
+    parts = re.split(r"\s+\|\s+", text.strip())
+    name = parts[0].strip().strip("`")
+    if not name:
+        raise SpecError("target: needs a name")
+    needs = None
+    for p in parts[1:]:
+        key, _, value = p.partition("=")
+        if key.strip() != "needs" or value.strip() not in NEEDS:
+            raise SpecError("target: options are needs=%s, got %r" % ("|".join(NEEDS), redact(p)))
+        needs = value.strip()
+    return Claim(name, needs)
 
 
 # ------------------------------------------------------------------ checks
@@ -337,6 +428,9 @@ def _check_commit(receipt):
 def check(receipt, default_timeout=60.0, allow_shell=False, cwd=None):
     """Run one receipt now. Returns (ok, message); ok is None for said: lines, which are
     recorded claims, not checks. Never raises for a failing system."""
+    if "target" in receipt.options and receipt.kind != "said" and not reads(receipt, receipt.options["target"]):
+        return False, "target=%s is not what this check reads; a check on another object proves nothing about it" % (
+            receipt.options["target"])
     try:
         if receipt.kind in ("cmd", "sh"):
             return _run_process(receipt, default_timeout, allow_shell, cwd)
@@ -498,6 +592,7 @@ def check_baseline(receipt, ok, default_timeout=60.0, allow_shell=False):
 
 ITEM = re.compile(r"^(\s*)- \[([ xX])\] (\d+)\. (.*)$")
 RECEIPT_LINE = re.compile(r"^\s+- receipt: `(.+)`\s*$")
+TARGET_LINE = re.compile(r"^\s+- target: (.+?)\s*$")
 
 
 class Step(object):
@@ -507,6 +602,7 @@ class Step(object):
         self.text = text
         self.done = done
         self.receipts = []  # (line_no, Receipt)
+        self.claim = None  # Claim, from a "- target:" line
 
 
 def parse_ledger(text):
@@ -520,6 +616,10 @@ def parse_ledger(text):
         r = RECEIPT_LINE.match(line)
         if r and current is not None:
             current.receipts.append((i, parse_spec(r.group(1))))
+            continue
+        t = TARGET_LINE.match(line)
+        if t and current is not None:
+            current.claim = parse_claim(t.group(1))
     return steps
 
 
@@ -527,9 +627,10 @@ def _numbers(label, idx):
     return "%s %s" % (label if len(idx) == 1 else label + "s", ", ".join(str(i) for i in idx))
 
 
-def judge(results, min_instruments, require_baseline=False):
+def judge(results, min_instruments, require_baseline=False, claim=None):
     """results: list of (Receipt, ok, msg) or (Receipt, ok, msg, baseline_verdict), where
-    baseline_verdict is None for a receipt that asked for no baseline. Returns (proven, reason)."""
+    baseline_verdict is None for a receipt that asked for no baseline. claim: the Claim the
+    step makes, or None. Returns (proven, reason)."""
     if not results:
         return False, "no receipts"
     results = [tuple(x) + (None,) * (4 - len(x)) for x in results]
@@ -544,6 +645,15 @@ def judge(results, min_instruments, require_baseline=False):
         return False, "%s VACUOUS: passes before the change too, so it is not evidence" % _numbers(
             "receipt", vacuous)
     behaviour = [(r, v) for r, ok, _, v in results if ok and r.proves != "config" and v != VACUOUS]
+    off = []
+    if claim is not None and behaviour:
+        off = [r for r, _ in behaviour if not about(r, claim.name)]
+        behaviour = [(r, v) for r, v in behaviour if about(r, claim.name)]
+        if not behaviour:
+            return False, "no passing behaviour receipt is about the claimed target %s; a check on another object proves nothing about it" % claim.name
+        if claim.needs == "sha256" and not any(r.kind == "file" and "sha256" in r.options for r, _ in behaviour):
+            return False, ("the claim needs the sha256 of %s; a listing (name and size) or an existence check "
+                           "does not show the content is right" % claim.name)
     if not behaviour:
         if vacuous:
             return False, "only VACUOUS behaviour receipts passed; a receipt that passes before the change is not evidence"
@@ -559,6 +669,8 @@ def judge(results, min_instruments, require_baseline=False):
     note = "; %d failed before the change" % baselined if baselined else ""
     if vacuous:
         note += "; %s VACUOUS, not counted" % _numbers("receipt", vacuous)
+    if off:
+        note += "; %d receipt(s) about another object, not counted" % len(off)
     return True, "%d receipt(s); behaviour checked through %d instrument(s): %s%s" % (
         len(results), len(instruments), ", ".join(instruments), note)
 
@@ -593,6 +705,7 @@ def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     timeout, allow_shell, min_inst, list_only, do_reopen, ledger = 60.0, False, 1, False, False, None
     require_baseline = False
+    claim_text = None
     specs = []
     it = iter(argv)
     try:
@@ -611,6 +724,8 @@ def main(argv=None):
                 do_reopen = True
             elif a == "--ledger":
                 ledger = next(it)
+            elif a == "--target":
+                claim_text = next(it)
             elif a in ("-h", "--help"):
                 print(__doc__)
                 return 0
@@ -624,7 +739,7 @@ def main(argv=None):
     except SpecError as e:
         print("usage error: %s" % e, file=sys.stderr)
         return 2
-    if bool(ledger) == bool(specs) or (do_reopen and not ledger):
+    if bool(ledger) == bool(specs) or (do_reopen and not ledger) or (claim_text is not None and ledger):
         print(__doc__, file=sys.stderr)
         return 2
 
@@ -637,6 +752,7 @@ def main(argv=None):
             text = None
             step = Step(0, "-", "command-line receipts", True)
             step.receipts = [(0, parse_spec(s)) for s in specs]
+            step.claim = parse_claim(claim_text) if claim_text is not None else None
             steps = [step]
     except (OSError, SpecError) as e:
         print("error: %s" % redact(e), file=sys.stderr)
@@ -647,6 +763,8 @@ def main(argv=None):
             print(redact("step %s [%s] %s" % (s.number, "x" if s.done else " ", s.text)))
             for _, r in s.receipts:
                 print(redact("  %s:%s  options=%s  via=%s  proves=%s" % (r.kind, r.target, r.options, r.instrument(), r.proves)))
+            if s.claim is not None:
+                print(redact("  target: %s%s" % (s.claim.name, " needs=%s" % s.claim.needs if s.claim.needs else "")))
         return 0
 
     n_pass = n_fail = 0
@@ -667,7 +785,7 @@ def main(argv=None):
                 verdicts[baseline[0]] += 1
             results.append((r, ok, msg, baseline and baseline[0]))
             _print_receipt(idx, r, ok, msg, baseline)
-        proven, reason = judge(results, min_inst, require_baseline)
+        proven, reason = judge(results, min_inst, require_baseline, s.claim)
         if s.done:
             print(redact("  -> %s: %s" % ("PROVEN" if proven else "UNPROVEN", reason)))
             if not proven:

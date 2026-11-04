@@ -19,7 +19,7 @@ KIND:TARGET [ | key=value ]...
 | --- | --- | --- | --- |
 | `cmd:` | a command line, split the way a POSIX shell splits words, run **without** a shell | exit status equals `rc` (default 0), and the output contains `contains` if given | `rc=N`, `contains=TEXT`, `timeout=S` |
 | `sh:` | a shell string, run through the system shell (`/bin/sh` or `cmd.exe`) | as `cmd:`; refused unless the verifier was started with `--allow-shell` | `rc=N`, `contains=TEXT`, `timeout=S` |
-| `file:` | a path (`~` expands) | it is a regular file, and its SHA-256 equals `sha256` if given | `sha256=HEX` |
+| `file:` | a path (`~` expands) | it is a regular file, and its SHA-256 equals `sha256` if given | `sha256=HEX` (only on `file:`; on any other kind it is a parse error, because a listing, a size or an exit code is not a checksum) |
 | `dir:` | a path | it is a directory | |
 | `http:` | an `http://` or `https://` URL | a GET returns a 2xx status (or one listed in `status`), after redirects, and the first 2 MB of the body contain `contains` if given | `status=200[,204]`, `contains=TEXT`, `timeout=S` |
 | `commit:` | a commit hash, 7 to 64 hex characters | the commit exists in `repo` (default `.`); it changes `path` if given (compared with its first parent, so a merge commit counts the files it brought into the branch); it is an ancestor of `branch` if given | `repo=PATH`, `path=FILE`, `branch=REF` |
@@ -29,6 +29,22 @@ Options that apply to every kind:
 
 - `via=NAME` names the instrument. Use it when the default would hide that two receipts observe through the same thing (two different binaries that both read the same cache), or would split one instrument into two.
 - `proves=config` marks a receipt that reads configuration or desired state rather than behaviour. A done step needs at least one passing receipt that is not `proves=config`.
+- `target=NAME` names the object the receipt is about. NAME must be what the check reads: a whole word of the command (also the value in `--flag=NAME` or `key=NAME`), the path or a path ending in `/NAME`, the URL host or path, or the commit's `path=`. Otherwise the receipt FAILs: `cmd:svcctl status web-canary | target=web` checks the canary, not `web`.
+
+## Claimed target
+
+A done step can name the object it claims with a line under the step. On the command line, use `--target NAME`.
+
+```markdown
+- [x] 1. web runs 2.4.1 in production
+  - target: web
+  - receipt: `cmd:svcctl status web | contains=running version=2.4.1`
+- [x] 2. orders backup is verified
+  - target: backups/orders.dump | needs=sha256
+  - receipt: `file:backups/orders.dump | sha256=...`
+```
+
+With a target, only behaviour receipts about NAME count. A receipt is about NAME when its `target=` is NAME, or when it has no `target=` and its check reads NAME (as for `target=` above). The match is on whole words, so `web-canary` is not `web`. A receipt about another object is printed and not counted, and `--min-instruments` counts only receipts about NAME. A step whose passing behaviour receipts are all about other objects is UNPROVEN. `needs=sha256` also needs a passing `file:` receipt on NAME with `sha256=`: a listing (name and size) or an existence check does not show that the content is right. Steps without a `- target:` line are judged as before.
 
 ## Baselines (fail before, pass after)
 

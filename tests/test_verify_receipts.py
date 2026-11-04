@@ -688,6 +688,122 @@ class LedgerTests(unittest.TestCase):
             self.assertEqual(fh.read(), after)
 
 
+TARGET_LEDGER = """# Ledger: deploy shop 3.1.0
+
+- [x] 1. shop runs 3.1.0 in production
+  - target: shop
+  - receipt: `cmd:{py} -c "import sys; print(sys.argv[1] + ': running 3.1.0')" shop-canary | contains=running 3.1.0`
+- [x] 2. shop runs 3.1.0 in production
+  - target: shop
+  - receipt: `cmd:{py} -c "import sys; print(sys.argv[1] + ': running 3.1.0')" shop | contains=running 3.1.0`
+- [x] 3. accounts backup is verified
+  - target: {dump} | needs=sha256
+  - receipt: `file:{dump}`
+  - receipt: `dir:{bdir}`
+- [x] 4. accounts backup is verified
+  - target: {dump} | needs=sha256
+  - receipt: `file:{dump} | sha256={sha}`
+"""
+
+
+class TargetTests(unittest.TestCase):
+    """A receipt counts for a claim only when it checks the object the claim names."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.bdir = os.path.join(self.d, "backups").replace("\\", "/")
+        os.mkdir(self.bdir)
+        self.dump = self.bdir + "/accounts.dump"
+        with open(self.dump, "wb") as fh:
+            fh.write(b"rows")
+        self.sha = hashlib.sha256(b"rows").hexdigest()
+
+    def tearDown(self):
+        shutil.rmtree(self.d)
+
+    def _res(self, *specs):
+        return [(vr.parse_spec(s), True, "ok", None) for s in specs]
+
+    def test_receipt_target_must_be_what_the_check_reads(self):
+        ok, msg = check("cmd:%s -c pass web-canary | target=web" % PY)
+        self.assertFalse(ok)
+        self.assertIn("not what this check reads", msg)
+        self.assertTrue(check("cmd:%s -c pass web | target=web" % PY)[0])
+
+    def test_receipt_target_on_paths_and_urls(self):
+        self.assertTrue(check("file:%s | target=accounts.dump" % self.dump)[0])
+        self.assertFalse(check("file:%s | target=orders.dump" % self.dump)[0])
+        r = vr.parse_spec("http:https://shop.example.test/version | target=shop.example.test")
+        self.assertTrue(vr.reads(r, "shop.example.test"))
+        self.assertFalse(vr.reads(r, "shop-canary.example.test"))
+
+    def test_word_match_is_whole_word(self):
+        r = vr.parse_spec("cmd:svcctl status web-canary")
+        self.assertFalse(vr.about(r, "web"))
+        self.assertTrue(vr.about(r, "web-canary"))
+        self.assertTrue(vr.about(vr.parse_spec("cmd:svcctl status --service=web"), "web"))
+
+    def test_judge_counts_only_receipts_about_the_claim(self):
+        claim = vr.Claim("web")
+        proven, reason = vr.judge(self._res("cmd:svcctl status web-canary"), 1, claim=claim)
+        self.assertFalse(proven)
+        self.assertIn("claimed target web", reason)
+        proven, reason = vr.judge(self._res("cmd:svcctl status web-canary", "cmd:svcctl status web"), 1, claim=claim)
+        self.assertTrue(proven)
+        self.assertIn("1 receipt(s) about another object, not counted", reason)
+        # min-instruments counts only receipts about the claim
+        res = self._res("cmd:svcctl status web", "http:https://web-canary.example.test/")
+        self.assertFalse(vr.judge(res, 2, claim=claim)[0])
+
+    def test_explicit_target_overrides_the_words(self):
+        claim = vr.Claim("web")
+        self.assertFalse(vr.judge(self._res("cmd:svcctl status web | target=web-canary"), 1, claim=claim)[0])
+
+    def test_listing_does_not_satisfy_a_checksum_claim(self):
+        claim = vr.Claim(self.dump, "sha256")
+        proven, reason = vr.judge(self._res("file:%s" % self.dump, "cmd:ls -l %s" % self.dump), 1, claim=claim)
+        self.assertFalse(proven)
+        self.assertIn("needs the sha256", reason)
+        self.assertTrue(vr.judge(self._res("file:%s | sha256=%s" % (self.dump, self.sha)), 1, claim=claim)[0])
+
+    def test_sha256_only_on_file_receipts(self):
+        for spec in ("cmd:ls -l backups/ | sha256=%s" % self.sha, "dir:backups | sha256=%s" % self.sha,
+                     "http:https://a.example.test/f | sha256=%s" % self.sha):
+            with self.assertRaises(vr.SpecError) as cm:
+                vr.parse_spec(spec)
+            self.assertIn("not a checksum", str(cm.exception))
+
+    def test_no_claim_keeps_old_behaviour(self):
+        self.assertTrue(vr.judge(self._res("cmd:svcctl status web-canary"), 1)[0])
+
+    def test_parse_claim(self):
+        c = vr.parse_claim("`backups/a.dump` | needs=sha256")
+        self.assertEqual((c.name, c.needs), ("backups/a.dump", "sha256"))
+        with self.assertRaises(vr.SpecError):
+            vr.parse_claim("x | needs=md5")
+
+    def test_ledger(self):
+        ledger = os.path.join(self.d, "receipts.md")
+        with open(ledger, "w") as fh:
+            fh.write(TARGET_LEDGER.format(py=PY, dump=self.dump, bdir=self.bdir, sha=self.sha))
+        rc, out = run_main(["--ledger", ledger])
+        self.assertEqual(rc, 1)
+        self.assertIn("summary: 5 pass, 0 fail; 2 of 4 done step(s) proven", out)
+        self.assertIn("claimed target shop;", out)
+        self.assertIn("needs the sha256", out)
+        rc, out = run_main(["--ledger", ledger, "--list"])
+        self.assertIn("target: shop", out)
+
+    def test_command_line_target(self):
+        spec = "cmd:%s -c pass shop-canary" % PY
+        self.assertEqual(run_main([spec])[0], 0)
+        rc, out = run_main(["--target", "shop", spec])
+        self.assertEqual(rc, 1)
+        self.assertIn("claimed target shop", out)
+        self.assertEqual(run_main(["--target", "shop", "cmd:%s -c pass shop" % PY])[0], 0)
+        self.assertEqual(run_main(["--target", "shop", "--ledger", "x.md"])[0], 2)
+
+
 class UsageTests(unittest.TestCase):
     def test_no_args(self):
         self.assertEqual(run_main([])[0], 2)
