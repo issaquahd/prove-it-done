@@ -1,6 +1,9 @@
 # Changelog
 
-All notable changes to this project are listed here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/).
+All notable changes to this project are documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
@@ -18,3 +21,6 @@ All notable changes to this project are listed here. The format follows [Keep a 
 - `examples/`: a deploy, a config change, a published page, and a worker whose "ok" was false.
 - `evals/`: eight test prompts, a transcript scorer built on the Agent Trace Clinic's `unproven_completion` detector, four synthetic transcripts, and a with/without protocol.
 - Unit tests, and a CI workflow for Linux, macOS and Windows.
+
+[Unreleased]: https://github.com/issaquahd/prove-it-done/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/issaquahd/prove-it-done/releases/tag/v0.1.0
